@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////
-// BluetoothDeviceManager
+// BluetoothDeviceManager v2.0.0
 // Created by: Larry Lart
 //
 // Single entry point for all BLE operations used by BleHub:

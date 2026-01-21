@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////
-// BleHub
+// BleHub v2.0.0
 // Created by: Larry Lart
 //
 // High-level BLE + micro-TLS hub for the Blue Keyboard dongle.
