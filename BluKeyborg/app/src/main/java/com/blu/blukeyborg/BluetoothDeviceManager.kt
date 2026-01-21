@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////
-// BluetoothDeviceManager v2.0.0
+// BluetoothDeviceManager v2.0.1
 // Created by: Larry Lart
 //
 // Single entry point for all BLE operations used by BleHub:
@@ -324,12 +324,12 @@ class BluetoothDeviceManager(private val context: Context)
 				mfg == null -> false
 
 				// Normal case: payload-only (no companyId in returned array)
-				mfg.size == 10 &&
+				mfg.size >= 2 &&
 					mfg[0] == 'B'.code.toByte() &&
 					mfg[1] == 'K'.code.toByte() -> true
 
 				// Compatibility case: returned array still includes companyId prefix
-				mfg.size == 12 &&
+				mfg.size >= 4 &&
 					(mfg[0].toInt() and 0xFF) == 0xFF &&
 					(mfg[1].toInt() and 0xFF) == 0xFF &&
 					mfg[2] == 'B'.code.toByte() &&
@@ -783,9 +783,9 @@ class BluetoothDeviceManager(private val context: Context)
 	{
 		override fun onConnectionStateChange(g: android.bluetooth.BluetoothGatt, status: Int, newState: Int) {
 			if (isStaleGatt(g)) return
-			
+
 			logd("onConnectionStateChange: status=$status newState=$newState for ${g.device.address}")
-			
+
 			// Connected: request high priority and a larger MTU before service discovery
 			if (status == android.bluetooth.BluetoothGatt.GATT_SUCCESS &&
 				newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
@@ -806,77 +806,80 @@ class BluetoothDeviceManager(private val context: Context)
 						logd("requestConnectionPriority(CONNECTION_PRIORITY_HIGH)")
 						g.requestConnectionPriority(android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_HIGH)
 					} catch (_: Throwable) {
-						
 						logd("requestConnectionPriority failed")
 					}
-				}	
+				}
 
-					/* seems to fail on newq phones? 
-					// Request a larger MTU so the dongle can send the whole line in one notify
-					if (android.os.Build.VERSION.SDK_INT >= 21) {
-						//val ok = try { g.requestMtu(247) } catch (_: Throwable) { false }
-						val ok = try { g.requestMtu(130) } catch (_: Throwable) { false }
+				// Optional MTU hint – see next section
+				val wantMtu = 185 // or 185/247 - check if stable
+				if (android.os.Build.VERSION.SDK_INT >= 21) {
+					try {
+						logd("requestMtu($wantMtu)")
+						val ok = g.requestMtu(wantMtu)
 						if (!ok) {
-							// If request failed, proceed anyway
-							g.discoverServices()
-						}
-					} else {
-						g.discoverServices()
-					}
-					*/
-					
-					// Optional MTU hint – see next section
-					val wantMtu = 185 // or 185/247 - check if stable				
-					if (android.os.Build.VERSION.SDK_INT >= 21) {
-						try {
-							logd("requestMtu($wantMtu)")
-							val ok = g.requestMtu(wantMtu)
-							if (!ok) {
-								// If MTU request was rejected synchronously, fall back to immediate discovery
-								if (!servicesDiscoveryStarted) {
-									servicesDiscoveryStarted = true
-									logd("requestMtu($wantMtu) returned false, calling discoverServices() immediately")
-									g.discoverServices()
-								}
-							} else {
-								// Normal case: we'll call discoverServices() in onMtuChanged()
-								logd("requestMtu($wantMtu) accepted, waiting for onMtuChanged()")
-							}
-						} catch (t: Throwable) {
-							logd("requestMtu($wantMtu) threw: ${t.message}")
+							// If MTU request was rejected synchronously, fall back to immediate discovery
 							if (!servicesDiscoveryStarted) {
 								servicesDiscoveryStarted = true
-								logd("Falling back to discoverServices() after MTU exception")
-								try { g.discoverServices() } catch (t2: Throwable) {
-									loge("discoverServices() failed", t2)
-									fail("Service discovery start failed: ${t2.message}")
-								}
+								logd("requestMtu($wantMtu) returned false, calling discoverServices() immediately")
+								g.discoverServices()
 							}
+						} else {
+							// Normal case: we'll call discoverServices() in onMtuChanged()
+							logd("requestMtu($wantMtu) accepted, waiting for onMtuChanged()")
+
+							// === ANDROID 7 FIX (MINIMAL) ===
+							// Some stacks never call onMtuChanged() (or keep MTU=23 and never callback).
+							// Arm a one-shot fallback to start discovery anyway, but ONLY if this GATT
+							// is still the current active session.
+							main.postDelayed({
+								val cur = gatt
+								if (cur == null || cur !== g) return@postDelayed
+								if (servicesDiscoveryStarted) return@postDelayed
+
+								servicesDiscoveryStarted = true
+								try {
+									logd("MTU fallback: discoverServices() (onMtuChanged didn't fire)")
+									g.discoverServices()
+								} catch (t: Throwable) {
+									loge("discoverServices() failed (MTU fallback)", t)
+									fail("Service discovery start failed: ${t.message}")
+								}
+							}, 500L)
 						}
-					} else {
-						// Pre-21: no MTU callback – discover services immediately once
+					} catch (t: Throwable) {
+						logd("requestMtu($wantMtu) threw: ${t.message}")
 						if (!servicesDiscoveryStarted) {
 							servicesDiscoveryStarted = true
-							try {
-								logd("discoverServices() (pre-21)")
-								g.discoverServices()
-							} catch (t: Throwable) {
-								loge("discoverServices() failed", t)
-								fail("Service discovery start failed: ${t.message}")
+							logd("Falling back to discoverServices() after MTU exception")
+							try { g.discoverServices() } catch (t2: Throwable) {
+								loge("discoverServices() failed", t2)
+								fail("Service discovery start failed: ${t2.message}")
 							}
 						}
 					}
-				
-				
+				} else {
+					// Pre-21: no MTU callback – discover services immediately once
+					if (!servicesDiscoveryStarted) {
+						servicesDiscoveryStarted = true
+						try {
+							logd("discoverServices() (pre-21)")
+							g.discoverServices()
+						} catch (t: Throwable) {
+							loge("discoverServices() failed", t)
+							fail("Service discovery start failed: ${t.message}")
+						}
+					}
+				}
+
 			// Any other transition (disconnect / error) is treated as a failure
-            // for the current operation. The app can decide whether to retry.
+			// for the current operation. The app can decide whether to retry.
 			} else {
-				
+
 				// fire the one-shot "awaitDisconnected" callback if we truly disconnected
 				if (newState == android.bluetooth.BluetoothProfile.STATE_DISCONNECTED) {
-					
+
 					logd("STATE_DISCONNECTED for ${g.device.address} status=$status")
-					
+
 					bleConnected.postValue(false)
 
 					// fire awaitDisconnected waiter
@@ -893,7 +896,7 @@ class BluetoothDeviceManager(private val context: Context)
 						shouldCloseOnDisconnect = false
 						logd("Closed gatt after DISCONNECTED for ${g.device.address}")
 					}
-					
+
 					// If we initiated disconnect, swallow it and do NOT fail.
 					if (intentionalDisconnect) {
 						intentionalDisconnect = false
@@ -910,108 +913,142 @@ class BluetoothDeviceManager(private val context: Context)
 
 					// Unexpected disconnect after having been connected -> fail.
 					fail("Disconnected status=$status")
-					return				
+					return
 				}
-				
+
 				bleConnected.postValue(false)
-				
+
 				loge("Connection change treated as failure: status=$status newState=$newState")
 				fail("Connection state=$newState status=$status")
 			}
 		}
 
-        override fun onServicesDiscovered(g: android.bluetooth.BluetoothGatt, status: Int) {
+		override fun onServicesDiscovered(g: android.bluetooth.BluetoothGatt, status: Int) {
 			if (isStaleGatt(g)) return
-			
-			logd("onServicesDiscovered: status=$status for ${g.device.address}")
-            if (status == android.bluetooth.BluetoothGatt.GATT_SUCCESS) {
-				// Service discovery succeeded – mark as ready
-				discovered = true  
-		
-                // Look up the Nordic UART (NUS) service and its characteristics.
-                // TX = write characteristic, RX = notify characteristic.
-                val svc = g.getService(BleHub.SERVICE_UUID)
-                lastCharacteristic = svc?.getCharacteristic(BleHub.CHAR_UUID) // TX (write)
-                notifyCharacteristic = svc?.getCharacteristic(BleHub.RX_UUID) // RX (notify)
-				logd("NUS service=${svc != null} tx=${lastCharacteristic != null} rx=${notifyCharacteristic != null}")
-				
-                if (notifyCharacteristic != null) {
-                    // Enable notifications on RX
-                    g.setCharacteristicNotification(notifyCharacteristic, true)
-					logd("setCharacteristicNotification(true) for RX characteristic")
-					
-                    val cccd = notifyCharacteristic!!.getDescriptor(
-                        java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                    )
-                    if (cccd != null) {
-                        cccd.value = android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        // Write descriptor - completion handled in onDescriptorWrite
-						logd("Writing CCCD descriptor for notifications")
-                        if (!g.writeDescriptor(cccd)) {
-                            // Could not write CCCD - still try to continue
-							logd("Could not write CCCD - still try to continue")
-                            notificationsEnabled = false
-                            succeed()
-                        }
-                    } else {
-                        // No CCCD available - continue anyway
-						logd("No CCCD descriptor found, continuing without notifications")
-                        notificationsEnabled = false
-                        succeed()
-                    }
-                } else {
-                    // No RX, but we can still write-only
-					logd("No RX characteristic found; write-only connection")
-                    notificationsEnabled = false
-                    succeed()
-                }
-            } else {
-				loge("Service discovery failed status=$status")
-                fail("Service discovery failed status=$status")
-            }
-        }
 
-        override fun onDescriptorWrite(
-            g: android.bluetooth.BluetoothGatt,
-            descriptor: android.bluetooth.BluetoothGattDescriptor,
-            status: Int
-        ) {
+			logd("onServicesDiscovered: status=$status for ${g.device.address}")
+			if (status != android.bluetooth.BluetoothGatt.GATT_SUCCESS) {
+				loge("Service discovery failed status=$status")
+				fail("Service discovery failed status=$status")
+				return
+			}
+
+			// Service discovery succeeded – mark as ready
+			discovered = true
+
+			// Look up the Nordic UART (NUS) service and its characteristics.
+			// TX = write characteristic, RX = notify characteristic.
+			val svc = g.getService(BleHub.SERVICE_UUID)
+			lastCharacteristic = svc?.getCharacteristic(BleHub.CHAR_UUID) // TX (write)
+			notifyCharacteristic = svc?.getCharacteristic(BleHub.RX_UUID) // RX (notify)
+			logd("NUS service=${svc != null} tx=${lastCharacteristic != null} rx=${notifyCharacteristic != null}")
+
+			val rx = notifyCharacteristic
+			if (rx == null) {
+				// No RX, but we can still write-only
+				logd("No RX characteristic found; write-only connection")
+				notificationsEnabled = false
+				succeed()
+				return
+			}
+
+			// Enable notifications on RX (local)
+			val localOk = g.setCharacteristicNotification(rx, true)
+			logd("setCharacteristicNotification(true) for RX characteristic (localOk=$localOk)")
+
+			val cccd = rx.getDescriptor(
+				java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+			)
+
+			if (cccd == null) {
+				// Without CCCD, notifications won't work reliably. Fail so caller can reconnect/retry.
+				loge("No CCCD descriptor found on RX; cannot enable notifications reliably")
+				notificationsEnabled = false
+				fail("No CCCD descriptor found on RX")
+				return
+			}
+
+			// Android 7 often needs a short delay between setCharacteristicNotification() and CCCD write.
+			cccd.value = android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+
+			val handler = android.os.Handler(android.os.Looper.getMainLooper())
+			handler.postDelayed({
+				if (isStaleGatt(g)) return@postDelayed
+
+				logd("Writing CCCD descriptor for notifications (attempt 1)")
+				val ok1 = g.writeDescriptor(cccd)
+				if (ok1) {
+					// Completion handled in onDescriptorWrite()
+					return@postDelayed
+				}
+
+				// Retry once; Android 7 frequently returns false on first attempt.
+				logd("writeDescriptor(CCCD) returned false (attempt 1); retrying after 250ms")
+				handler.postDelayed({
+					if (isStaleGatt(g)) return@postDelayed
+
+					logd("Writing CCCD descriptor for notifications (attempt 2)")
+					val ok2 = g.writeDescriptor(cccd)
+					if (!ok2) {
+						// If we "succeed()" here we will hang waiting for B0/layout forever.
+						loge("writeDescriptor(CCCD) returned false (attempt 2); failing connect to force retry")
+						notificationsEnabled = false
+						fail("CCCD write could not be queued (Android 7 stack)")
+					}
+					// else: wait for onDescriptorWrite()
+				}, 250L)
+			}, 200L)
+		}
+
+		override fun onDescriptorWrite(
+			g: android.bluetooth.BluetoothGatt,
+			descriptor: android.bluetooth.BluetoothGattDescriptor,
+			status: Int
+		) {
 			if (isStaleGatt(g)) return
-			
+
 			logd("onDescriptorWrite: uuid=${descriptor.uuid} status=$status for ${g.device.address}")
-			
-            // We don't fail the connect on CCCD errors – we just track whether
-            // notifications are actually enabled and complete the connect().			
-            if (status == android.bluetooth.BluetoothGatt.GATT_SUCCESS &&
-                descriptor.characteristic == notifyCharacteristic) {
-                notificationsEnabled = true
-				 logd("Notifications enabled on RX characteristic")
-            } else {
-                logd("CCCD write did not succeed or not RX; notificationsEnabled=$notificationsEnabled")
-            }
-            // Signal connect() completion (do not close)
-            succeed()
-        }
+
+			// Only treat CCCD write for RX as connection-completing.
+			val isCccd = descriptor.uuid.toString().equals("00002902-0000-1000-8000-00805f9b34fb", ignoreCase = true)
+			val isRx = (descriptor.characteristic == notifyCharacteristic)
+
+			if (isCccd && isRx && status == android.bluetooth.BluetoothGatt.GATT_SUCCESS) {
+				notificationsEnabled = true
+				logd("Notifications enabled on RX characteristic")
+				succeed()
+				return
+			}
+
+			// CCCD write failed or wrong characteristic.
+			loge("CCCD write failed or unexpected descriptor; status=$status isCccd=$isCccd isRx=$isRx")
+			notificationsEnabled = false
+
+			// Fail so the caller can reconnect/retry cleanly (prevents waiting forever for B0/layout).
+			fail("CCCD enable failed status=$status")
+		}
 
 		override fun onCharacteristicChanged(
 			g: android.bluetooth.BluetoothGatt,
 			characteristic: android.bluetooth.BluetoothGattCharacteristic
 		) {
 			if (isStaleGatt(g)) return
-			
+
 			logd("onCharacteristicChanged from ${g.device.address}, len=${characteristic.value?.size ?: -1}")
-			
-            // Incoming notification from RX characteristic:
-            //
-            // 1) If a streaming listener is active -> deliver there and return.
-            // 2) Else if a one-shot listener is waiting -> deliver once and clear.
-            // 3) Else buffer the data for future consumers.			
+
 			if (characteristic == notifyCharacteristic) {
 				val data = characteristic.value
 
 				// 1) if a stream is active, deliver there (do NOT consume one-shot)
 				streamListener?.let { streamCb ->
-					streamCb(data)
+					try {
+						streamCb(data)
+					} catch (t: Throwable) {
+						// Never let exceptions escape a Bluetooth stack callback (Android 7 is unforgiving here)
+						loge("streamListener threw: ${t.javaClass.simpleName}: ${t.message}")
+						// Optional: trigger your existing failure/cleanup path if appropriate
+						// fail("Notification handler crashed: ${t.message}")
+					}
 					return
 				}
 
@@ -1020,7 +1057,13 @@ class BluetoothDeviceManager(private val context: Context)
 				if (cb != null) {
 					notifListener = null
 					try { notifTimeouts.removeCallbacksAndMessages(null) } catch (_: Throwable) {}
-					cb(data)
+
+					try {
+						cb(data)
+					} catch (t: Throwable) {
+						loge("notifListener threw: ${t.javaClass.simpleName}: ${t.message}")
+						// Optional: fail("Notification handler crashed: ${t.message}")
+					}
 				} else {
 					// 3) no one is listening -> buffer for the next waiter
 					synchronized(notifBuffer) { notifBuffer.addLast(data.copyOf()) }

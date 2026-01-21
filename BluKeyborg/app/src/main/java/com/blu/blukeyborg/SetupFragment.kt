@@ -253,7 +253,7 @@ class SetupFragment : Fragment(R.layout.fragment_setup) {
 					if (!isAdded) return@connectFromSettings
 					requireActivity().runOnUiThread {
 						if (ok) {
-							progressBody.text = "✅ Dongle setup completed successfully."							
+							progressBody.text = "✅ Setup completed successfully"							
 							PreferencesUtil.setUseExternalKeyboardDevice(ctx, true)
 
 							state = UiState.SUCCESS
@@ -287,7 +287,7 @@ class SetupFragment : Fragment(R.layout.fragment_setup) {
 						setStepOk(Step.PROVISIONED, "Provisioned")
 						setStepOk(Step.SECURE, "Secure connection")
 
-						progressBody.text = "✅ Dongle setup completed successfully."
+						progressBody.text = "✅ Setup completed successfully"
 					
 						PreferencesUtil.setUseExternalKeyboardDevice(ctx, true)
 

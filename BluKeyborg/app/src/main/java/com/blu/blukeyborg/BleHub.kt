@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////
-// BleHub v2.0.0
+// BleHub v2.0.1
 // Created by: Larry Lart
 //
 // High-level BLE + micro-TLS hub for the Blue Keyboard dongle.
@@ -1106,13 +1106,68 @@ object BleHub
 
 	// Put near hmacSha256() helpers
 	private fun pbkdf2Sha256_bytes(passBytes: ByteArray, salt: ByteArray, iters: Int, dkLen: Int = 32): ByteArray {
-		val skf = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-		val spec = javax.crypto.spec.PBEKeySpec(
-			// Convert bytes -> ISO-8859-1 chars so we control encoding => bytes round-trip 1:1
-			passBytes.toString(Charsets.ISO_8859_1).toCharArray(),
-			salt, iters, dkLen * 8
-		)
-		return skf.generateSecret(spec).encoded
+		require(iters > 0) { "iters must be > 0" }
+		require(dkLen > 0) { "dkLen must be > 0" }
+
+		// 1) Try platform implementation if it exists (newer devices).
+		try {
+			val skf = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+			val spec = javax.crypto.spec.PBEKeySpec(
+				// bytes -> ISO-8859-1 chars so bytes round-trip 1:1
+				passBytes.toString(Charsets.ISO_8859_1).toCharArray(),
+				salt,
+				iters,
+				dkLen * 8
+			)
+			return skf.generateSecret(spec).encoded
+		} catch (_: Throwable) {
+			// Fall through to manual PBKDF2-HMAC-SHA256 for older Android/provider variants (e.g., Android 7).
+		}
+
+		// 2) Manual PBKDF2-HMAC-SHA256 implementation (RFC 8018)
+		val hLen = 32 // SHA-256 output bytes
+		val l = (dkLen + hLen - 1) / hLen
+		val r = dkLen - (l - 1) * hLen
+
+		val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+		mac.init(javax.crypto.spec.SecretKeySpec(passBytes, "HmacSHA256"))
+
+		fun int32be(i: Int): ByteArray =
+			byteArrayOf(
+				((i ushr 24) and 0xFF).toByte(),
+				((i ushr 16) and 0xFF).toByte(),
+				((i ushr 8) and 0xFF).toByte(),
+				(i and 0xFF).toByte()
+			)
+
+		val out = ByteArray(dkLen)
+		var outPos = 0
+
+		val saltPlus = ByteArray(salt.size + 4)
+		System.arraycopy(salt, 0, saltPlus, 0, salt.size)
+
+		for (blockIndex in 1..l) {
+			// U1 = PRF(P, S || INT(blockIndex))
+			val bi = int32be(blockIndex)
+			System.arraycopy(bi, 0, saltPlus, salt.size, 4)
+
+			var u = mac.doFinal(saltPlus)
+			val t = u.copyOf()
+
+			// U2..Uc
+			for (_i in 2..iters) {
+				u = mac.doFinal(u)
+				for (k in 0 until hLen) {
+					t[k] = (t[k].toInt() xor u[k].toInt()).toByte()
+				}
+			}
+
+			val take = if (blockIndex == l) r else hLen
+			System.arraycopy(t, 0, out, outPos, take)
+			outPos += take
+		}
+
+		return out
 	}
 
 	// Same derivation but with "common firmware" normalizations:
@@ -1326,11 +1381,10 @@ object BleHub
 		if (userPassword == null || userPassword.isEmpty()) {
 			val ask = passwordPrompt
 			if (ask == null) {
-				loge( "APPKEY: no password prompt provider set")
+				loge("APPKEY: no password prompt provider set")
 				onDone(false, "No password UI")
 				return
 			}
-			// ensure main ui post
 			mainHandler.post {
 				ask(appCtx) { chars ->
 					if (chars == null || chars.isEmpty()) {
@@ -1346,239 +1400,181 @@ object BleHub
 					}
 				}
 			}
-
 			return
 		}
-			
-		// debug
-		logd( "APPKEY: sending A0 (GET_APPKEY) — expecting A2 within ${timeoutMs}ms")
-		ensureMgr().stopNotificationStream()   // NEW: nuke any previous stream before we start a new await
-		
-		
-		// Send A0 (GET_APPKEY)
-		////////////////////////////////////////////////////////////////
+
+		logd("APPKEY: sending A0 (GET_APPKEY) — expecting A2 within ${timeoutMs}ms")
+		ensureMgr().stopNotificationStream()
+
 		sendRawFrame(0xA0, ByteArray(0)) { ok, err ->
 			if (!ok) { onDone(false, err); return@sendRawFrame }
 
 			awaitNextFrame(timeoutMs, predicate = { it.op == 0xA2 || it.op == 0xFF }) { f ->
-			
-                if (f == null) {
-                    onDone(false, "No CHALLENGE")
-                    return@awaitNextFrame
-                }
-                if (f.op == 0xFF) {
-                    onDone(false, mapAppKeyErrorFromDevice(f.payload))
-                    return@awaitNextFrame
-                }
+				if (f == null) {
+					onDone(false, "No CHALLENGE")
+					return@awaitNextFrame
+				}
+				if (f.op == 0xFF) {
+					onDone(false, mapAppKeyErrorFromDevice(f.payload))
+					return@awaitNextFrame
+				}
 
-				logd( String.format("APPKEY: got A2 op=0x%02X payLen=%d", f.op, f.payload.size))						
-				
 				val pay = f.payload
-							
 				if (pay.size != (16 + 4 + 16)) { onDone(false, "Bad CHALLENGE"); return@awaitNextFrame }
+
 				val salt = pay.copyOfRange(0, 16)
 				val iters = java.nio.ByteBuffer.wrap(pay.copyOfRange(16, 20))
 					.order(java.nio.ByteOrder.LITTLE_ENDIAN).int
-				val chal  = pay.copyOfRange(20, 36)
-				//logd( "APPKEY: challenge iters=$iters")
-				// debug
-				logd( "APPKEY: challenge salt=${salt.toHex()} iters=$iters chal=${chal.toHex()}")
+				val chal = pay.copyOfRange(20, 36)
 
-				val passIn = userPassword
-				if (passIn == null || passIn.isEmpty()) {
-					onDone(false, "Password required"); return@awaitNextFrame
-				}
-				val passChars = passIn.copyOf() // defensive copy for this scope
+				logd("APPKEY: challenge salt=${salt.toHex()} iters=$iters chal=${chal.toHex()}")
 
-				// --- Build message = "APPKEY" || chal16
-				val msg = java.io.ByteArrayOutputStream().apply {
-					write("APPKEY".toByteArray()); write(chal)
-				}.toByteArray()
+				val passChars = userPassword.copyOf()
 
-				// --- Derive password bytes (two candidates)
-				val passRawBytes  = String(passChars).toByteArray(Charsets.UTF_8)
-				val passNormBytes = normalizePasswordForFirmware(passChars)
-
-				// --- Debug the exact inputs both sides must agree on
-				//logd( "APPKEY: msg('APPKEY'||chal16)=${msg.toHex()}")
-				//logd( "APPKEY: passRawBytes[0..min(16)]=${passRawBytes.take(16).toByteArray().toHex()}")
-
-				// --- PBKDF2 + HMAC (RAW)
-				val verif_raw = pbkdf2Sha256_bytes(passRawBytes, salt, iters)
-				logd( "APPKEY: verif_raw[0..7]=${verif_raw.copyOfRange(0,8).toHex()}")
-				val mac_raw = hmacSha256(verif_raw, msg)
-				logd( "APPKEY: mac_raw=${mac_raw.toHex().take(8)}…")
-
-				// --- PBKDF2 + HMAC (NORMALIZED)
-				val verif_norm = pbkdf2Sha256_bytes(passNormBytes, salt, iters)
-				logd( "APPKEY: verif_norm[0..7]=${verif_norm.copyOfRange(0,8).toHex()}")
-				val mac_norm = hmacSha256(verif_norm, msg)
-				logd( "APPKEY: mac_norm=${mac_norm.toHex().take(8)}…")
-
-				// Try RAW first
-				fun sendProof(mac: ByteArray, then: (Boolean, Frame?) -> Unit) {
-					sendRawFrame(0xA3, mac) { ok2, err2 ->
-						if (!ok2) { onDone(false, err2); return@sendRawFrame }
-						awaitNextFrame(timeoutMs, predicate = { it.op == 0xA1 || it.op == 0xFF }) { f2 ->
-							then(f2 != null && f2.op == 0xA1, f2)
-						}
-					}
-				}
-
-				// Unwrap A1 payload when device sends encrypted APPKEY:
-				//
-				//  - legacy:   32-byte raw APPKEY
-				//  - wrapped:  48 bytes = cipher32 || mac16
-				//
-				// Wrap key = HMAC(verif, "AKWRAP" || chal)
-				// MAC       = HMAC(wrapKey, "AKMAC" || chal || cipher)[0..15]
-				// IV        = HMAC(verif, "AKIV"   || chal)[0..15]
-				//
-				// If MAC check passes, decrypt via AES-CTR to recover APPKEY.
-				fun tryUnwrapA1Maybe(
-					verif: ByteArray,    // 32 bytes verifier used for HMAC on the device side (verif_raw or verif_norm)
-					chal: ByteArray,     // 16-byte challenge used in this exchange
-					payload: ByteArray
-				): ByteArray? {
-					// legacy raw APPKEY: 32 bytes
-					if (payload.size == 32) return payload
-
-					// wrapped form: 48 bytes = cipher32 || mac16
-					if (payload.size == 48) {
-						val cipher = payload.copyOfRange(0, 32)
-						val macIn  = payload.copyOfRange(32, 48)
-
-						// wrapKey = HMAC(verif, "AKWRAP" || chal)
-						val wrapMsg = java.io.ByteArrayOutputStream().apply {
-							write("AKWRAP".toByteArray()); write(chal)
+				// Offload PBKDF2/HMAC to background thread (Android 7 can be slow; avoid blocking BLE callback thread)
+				Thread {
+					try {
+						val msg = java.io.ByteArrayOutputStream().apply {
+							write("APPKEY".toByteArray()); write(chal)
 						}.toByteArray()
-						val wrapKey = hmacSha256(verif, wrapMsg)
 
-						// macExp = HMAC(wrapKey, "AKMAC" || chal || cipher)[0..15]
-						val macMsg = java.io.ByteArrayOutputStream().apply {
-							write("AKMAC".toByteArray()); write(chal); write(cipher)
-						}.toByteArray()
-						val macExpFull = hmacSha256(wrapKey, macMsg)
-						val macExp = macExpFull.copyOfRange(0, 16)
-						if (!macExp.contentEquals(macIn)) {
-							loge( "APPKEY: wrapped A1 MAC mismatch")
-							return null
-						}
+						val passRawBytes = String(passChars).toByteArray(Charsets.UTF_8)
+						val passNormBytes = normalizePasswordForFirmware(passChars)
 
-						// IV = HMAC(verif, "AKIV" || chal)[0..15]
-						val ivMsg = java.io.ByteArrayOutputStream().apply {
-							write("AKIV".toByteArray()); write(chal)
-						}.toByteArray()
-						val ivFull = hmacSha256(verif, ivMsg)
-						val iv16 = ivFull.copyOfRange(0, 16)
+						val verif_raw = pbkdf2Sha256_bytes(passRawBytes, salt, iters)
+						val mac_raw = hmacSha256(verif_raw, msg)
 
-						// decrypt
-						val plain = aesCtrEnc(wrapKey, iv16, cipher)
-						if (plain.size != 32) {
-							loge( "APPKEY: decrypted size != 32")
-							return null
-						}
-						return plain
-					}
-					// unexpected size
-					loge( "APPKEY: unexpected A1 payload len=${payload.size}")
-					return null
-				}
+						val verif_norm = pbkdf2Sha256_bytes(passNormBytes, salt, iters)
+						val mac_norm = hmacSha256(verif_norm, msg)
 
-				// sendProof callback - with retry on bad proof
-				sendProof(mac_raw) { okRaw, f2 ->
-					if (okRaw && f2 != null && f2.op == 0xA1) {
-						val payload = f2.payload
-						val maybeKey = tryUnwrapA1Maybe(verif_raw, chal, payload)
-						if (maybeKey != null && maybeKey.size == 32) {
-							BleAppSec.putKey(appCtx, address, maybeKey)
-							
-							// DEBUG: verify we can read it back immediately
-							//val roundtrip = BleAppSec.getKey(appCtx, address)
-							//Log.d("BleHub", "APPKEY roundtrip after put: len=${roundtrip?.size ?: -1}")
-							
-							java.util.Arrays.fill(passChars, '\u0000')
-							onDone(true, null)
-							return@sendProof
-						}
-						// continue to normalized retry
-					}
-
-					// DEBUG: if firmware explicitly sent an error (0xFF), surface it instead of blindly retrying
-					if (f2 != null && f2.op == 0xFF) {
-						val errMsg = mapAppKeyErrorFromDevice(f2.payload)
-						java.util.Arrays.fill(passChars, '\u0000')
-						onDone(false, errMsg)
-						return@sendProof
-					}
-
-					// RAW rejected or unwrap failed — retry with normalized/trimmed
-					logd( "APPKEY: RAW proof rejected — retrying with normalized/trimmed…")
-
-					// Re-issue A0 to get a fresh challenge for the normalized path
-					sendRawFrame(0xA0, ByteArray(0)) { okR, errR ->
-						if (!okR) { onDone(false, errR); return@sendRawFrame }
-
-						awaitNextFrame(timeoutMs, predicate = { it.op == 0xA2 || it.op == 0xFF }) { fR ->
-							//if (fR == null || fR.op == 0xFF) { onDone(false, "No CHALLENGE (retry)"); return@awaitNextFrame }
-                            if (fR == null) {
-                                onDone(false, "No CHALLENGE (retry)")
-                                return@awaitNextFrame
-                            }
-                            if (fR.op == 0xFF) {
-                                onDone(false, mapAppKeyErrorFromDevice(fR.payload))
-                                return@awaitNextFrame
-                            }							
-
-							val payR = fR.payload
-							if (payR.size != 36) { onDone(false, "Bad CHALLENGE (retry)"); return@awaitNextFrame }
-
-							val saltR  = payR.copyOfRange(0, 16)
-							val itersR = java.nio.ByteBuffer.wrap(payR.copyOfRange(16, 20))
-								.order(java.nio.ByteOrder.LITTLE_ENDIAN).int
-							val chalR  = payR.copyOfRange(20, 36)
-
-							val msgR = java.io.ByteArrayOutputStream().apply {
-								write("APPKEY".toByteArray()); write(chalR)
-							}.toByteArray()
-
-							val verifR = pbkdf2Sha256_bytes(passNormBytes, saltR, itersR)
-							val macR   = hmacSha256(verifR, msgR)
-							logd( "APPKEY: retry mac_norm=${macR.toHex().take(8)}…")
-
-							sendProof(macR) { okNorm, f3 ->
-								if (!okNorm || f3 == null || f3.op != 0xA1) {
-									// if we got an error frame here, surface its message
-									if (f3 != null && f3.op == 0xFF) {
-										val errMsg = mapAppKeyErrorFromDevice(f3.payload)
-										java.util.Arrays.fill(passChars, '\u0000')
-										onDone(false, errMsg)
-									} else {
-										java.util.Arrays.fill(passChars, '\u0000')
-										onDone(false, "Proof rejected")
-									}
-									return@sendProof
+						fun sendProof(mac: ByteArray, then: (Boolean, Frame?) -> Unit) {
+							sendRawFrame(0xA3, mac) { ok2, err2 ->
+								if (!ok2) { onDone(false, err2); return@sendRawFrame }
+								awaitNextFrame(timeoutMs, predicate = { it.op == 0xA1 || it.op == 0xFF }) { f2 ->
+									then(f2 != null && f2.op == 0xA1, f2)
 								}
-
-								val payloadN = f3.payload
-								val maybeKeyN = tryUnwrapA1Maybe(verifR, chalR, payloadN)
-								if (maybeKeyN == null || maybeKeyN.size != 32) {
-									java.util.Arrays.fill(passChars, '\u0000')
-									onDone(false, "Proof rejected")
-									return@sendProof
-								}
-
-								BleAppSec.putKey(appCtx, address, maybeKeyN)
-								java.util.Arrays.fill(passChars, '\u0000')
-								onDone(true, null)
 							}
 						}
-					}
-				}
 
+						fun tryUnwrapA1Maybe(verif: ByteArray, chalLocal: ByteArray, payload: ByteArray): ByteArray? {
+							if (payload.size == 32) return payload
+
+							if (payload.size == 48) {
+								val cipher = payload.copyOfRange(0, 32)
+								val macIn = payload.copyOfRange(32, 48)
+
+								val wrapMsg = java.io.ByteArrayOutputStream().apply {
+									write("AKWRAP".toByteArray()); write(chalLocal)
+								}.toByteArray()
+								val wrapKey = hmacSha256(verif, wrapMsg)
+
+								val macMsg = java.io.ByteArrayOutputStream().apply {
+									write("AKMAC".toByteArray()); write(chalLocal); write(cipher)
+								}.toByteArray()
+								val macExp = hmacSha256(wrapKey, macMsg).copyOfRange(0, 16)
+								if (!macExp.contentEquals(macIn)) {
+									loge("APPKEY: wrapped A1 MAC mismatch")
+									return null
+								}
+
+								val ivMsg = java.io.ByteArrayOutputStream().apply {
+									write("AKIV".toByteArray()); write(chalLocal)
+								}.toByteArray()
+								val iv16 = hmacSha256(verif, ivMsg).copyOfRange(0, 16)
+
+								val plain = aesCtrEnc(wrapKey, iv16, cipher)
+								return if (plain.size == 32) plain else null
+							}
+
+							loge("APPKEY: unexpected A1 payload len=${payload.size}")
+							return null
+						}
+
+						// RAW first
+						sendProof(mac_raw) { okRaw, f2 ->
+							if (okRaw && f2 != null && f2.op == 0xA1) {
+								val maybeKey = tryUnwrapA1Maybe(verif_raw, chal, f2.payload)
+								if (maybeKey != null && maybeKey.size == 32) {
+									BleAppSec.putKey(appCtx, address, maybeKey)
+									java.util.Arrays.fill(passChars, '\u0000')
+									onDone(true, null)
+									return@sendProof
+								}
+							}
+
+							if (f2 != null && f2.op == 0xFF) {
+								val errMsg = mapAppKeyErrorFromDevice(f2.payload)
+								java.util.Arrays.fill(passChars, '\u0000')
+								onDone(false, errMsg)
+								return@sendProof
+							}
+
+							// Retry normalized/trimmed (new challenge)
+							logd("APPKEY: RAW proof rejected — retrying with normalized/trimmed…")
+
+							sendRawFrame(0xA0, ByteArray(0)) { okR, errR ->
+								if (!okR) { onDone(false, errR); return@sendRawFrame }
+
+								awaitNextFrame(timeoutMs, predicate = { it.op == 0xA2 || it.op == 0xFF }) { fR ->
+									if (fR == null) {
+										onDone(false, "No CHALLENGE (retry)")
+										return@awaitNextFrame
+									}
+									if (fR.op == 0xFF) {
+										onDone(false, mapAppKeyErrorFromDevice(fR.payload))
+										return@awaitNextFrame
+									}
+
+									val payR = fR.payload
+									if (payR.size != 36) { onDone(false, "Bad CHALLENGE (retry)"); return@awaitNextFrame }
+
+									val saltR = payR.copyOfRange(0, 16)
+									val itersR = java.nio.ByteBuffer.wrap(payR.copyOfRange(16, 20))
+										.order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+									val chalR = payR.copyOfRange(20, 36)
+
+									val msgR = java.io.ByteArrayOutputStream().apply {
+										write("APPKEY".toByteArray()); write(chalR)
+									}.toByteArray()
+
+									val verifR = pbkdf2Sha256_bytes(passNormBytes, saltR, itersR)
+									val macR = hmacSha256(verifR, msgR)
+
+									sendProof(macR) { okNorm, f3 ->
+										if (!okNorm || f3 == null || f3.op != 0xA1) {
+											if (f3 != null && f3.op == 0xFF) {
+												onDone(false, mapAppKeyErrorFromDevice(f3.payload))
+											} else {
+												onDone(false, "Proof rejected")
+											}
+											java.util.Arrays.fill(passChars, '\u0000')
+											return@sendProof
+										}
+
+										val maybeKeyN = tryUnwrapA1Maybe(verifR, chalR, f3.payload)
+										if (maybeKeyN == null || maybeKeyN.size != 32) {
+											java.util.Arrays.fill(passChars, '\u0000')
+											onDone(false, "Proof rejected")
+											return@sendProof
+										}
+
+										BleAppSec.putKey(appCtx, address, maybeKeyN)
+										java.util.Arrays.fill(passChars, '\u0000')
+										onDone(true, null)
+									}
+								}
+							}
+						}
+					} catch (t: Throwable) {
+						loge("APPKEY: KDF/proof computation failed", t)
+						try { java.util.Arrays.fill(passChars, '\u0000') } catch (_: Throwable) {}
+						onDone(false, "KDF/proof failed: ${t.message}")
+					}
+				}.start()
 			}
 		}
 	}
+
 
 	///////////////////////////////////////////
 	private fun genP256(): java.security.KeyPair 
@@ -1595,17 +1591,31 @@ object BleHub
 		return x509.copyOfRange(x509.size - 65, x509.size)
 	}
 	
-	private fun ecdh(priv: java.security.PrivateKey, srvPub65: ByteArray): ByteArray { 
-		val x = java.math.BigInteger(1, srvPub65.copyOfRange(1,33))
-		val y = java.math.BigInteger(1, srvPub65.copyOfRange(33,65))
-		val params = java.security.AlgorithmParameters.getInstance("EC").apply {
-			init(java.security.spec.ECGenParameterSpec("secp256r1"))
-		}.getParameterSpec(java.security.spec.ECParameterSpec::class.java)
+	// fix crash on andro 7
+	fun ecdh(priv: java.security.PrivateKey, srvPub65: ByteArray): ByteArray {
+		val x = java.math.BigInteger(1, srvPub65.copyOfRange(1, 33))
+		val y = java.math.BigInteger(1, srvPub65.copyOfRange(33, 65))
+
+		// Android 7 can throw: NoSuchAlgorithmException: EC AlgorithmParameters not available
+		// Fallback: derive ECParameterSpec by generating a temporary P-256 keypair and reading its params.
+		val params: java.security.spec.ECParameterSpec = try {
+			java.security.AlgorithmParameters.getInstance("EC").apply {
+				init(java.security.spec.ECGenParameterSpec("secp256r1"))
+			}.getParameterSpec(java.security.spec.ECParameterSpec::class.java)
+		} catch (_: Throwable) {
+			val kpg = java.security.KeyPairGenerator.getInstance("EC")
+			kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
+			val tmpPub = kpg.generateKeyPair().public as java.security.interfaces.ECPublicKey
+			tmpPub.params
+		}
+
 		val kf = java.security.KeyFactory.getInstance("EC")
-		val pubSpec = java.security.spec.ECPublicKeySpec(java.security.spec.ECPoint(x,y), params)
+		val pubSpec = java.security.spec.ECPublicKeySpec(java.security.spec.ECPoint(x, y), params)
 		val srvPub = kf.generatePublic(pubSpec)
+
 		val ka = javax.crypto.KeyAgreement.getInstance("ECDH")
-		ka.init(priv); ka.doPhase(srvPub, true)
+		ka.init(priv)
+		ka.doPhase(srvPub, true)
 		return ka.generateSecret()
 	}
 	

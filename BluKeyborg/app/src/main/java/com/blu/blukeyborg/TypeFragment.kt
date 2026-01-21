@@ -116,7 +116,15 @@ class TypeFragment : Fragment(R.layout.fragment_type) {
             requireActivity().runOnUiThread {
                 if (ok) {
                     appendHistory(value)
-                    inputEdit.text?.clear()
+					
+					// Android 7 IME quirk: clearing the Editable alone can leave composing text
+					// inside the keyboard's buffer, which reappears on next input.
+					inputEdit.post {
+						inputEdit.clearComposingText()
+						inputEdit.setText("")
+						inputEdit.setSelection(0)
+					}
+				
                 } else {
                     Toast.makeText(
                         requireContext(),
