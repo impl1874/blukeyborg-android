@@ -41,6 +41,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSpecialKeys: ImageButton
     private lateinit var btnFullKeyboard: ImageButton
     private lateinit var btnRemoteBottom: ImageButton
+    private lateinit var btnVideo: ImageButton
 
 	private var appClosing = false
 	
@@ -163,6 +164,7 @@ class MainActivity : AppCompatActivity() {
         btnSpecialKeys = findViewById(R.id.btnSpecialKeys)
         btnFullKeyboard = findViewById(R.id.btnFullKeyboard)
         btnRemoteBottom = findViewById(R.id.btnRemoteBottom)
+        btnVideo = findViewById(R.id.btnVideo)
     }
 
     // --------------------------------------------------------------------
@@ -229,6 +231,10 @@ class MainActivity : AppCompatActivity() {
 
 		btnRemoteBottom.setOnClickListener {
 			startActivity(Intent(this, RemoteControlActivity::class.java))
+		}
+
+		btnVideo.setOnClickListener {
+			startActivity(Intent(this, VideoCaptureActivity::class.java))
 		}
 	}
 
@@ -359,6 +365,8 @@ class MainActivity : AppCompatActivity() {
 		btnSpecialKeys.isEnabled = ready
 		btnFullKeyboard.isEnabled = ready
 		btnRemoteBottom.isEnabled = ready
+		// Video button is always enabled (doesn't need BLE connection)
+		btnVideo.isEnabled = true
 
 		val alpha = if (ready) 1.0f else 0.35f
 
@@ -400,12 +408,14 @@ class MainActivity : AppCompatActivity() {
 			btnSpecialKeys.visibility = View.VISIBLE
 			btnFullKeyboard.visibility = View.VISIBLE
 			btnRemoteBottom.visibility = View.VISIBLE
+			btnVideo.visibility = View.VISIBLE
 
 			// Optional: if you want them slightly dimmed when not on Type:
 			//val actionAlpha = if (onType) 1.0f else 0.75f
 			//btnSpecialKeys.alpha = actionAlpha
 			//btnFullKeyboard.alpha = actionAlpha
 			//btnRemoteBottom.alpha = actionAlpha
+			//btnVideo.alpha = actionAlpha
 		}
 	}
 

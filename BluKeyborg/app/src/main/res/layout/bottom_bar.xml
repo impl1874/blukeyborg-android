@@ -56,6 +56,18 @@
         android:contentDescription="Remote"
         android:src="@drawable/outline_tv_remote_24"
         android:tint="@android:color/black"
+        android:layout_marginEnd="16dp" />
+
+    <!-- Video -->
+    <ImageButton
+        android:id="@+id/btnVideo"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+		android:padding="6dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="Video"
+        android:src="@drawable/outline_videocam_24"
+        android:tint="@android:color/black"
         android:layout_marginEnd="16dp" />		
 
     <View

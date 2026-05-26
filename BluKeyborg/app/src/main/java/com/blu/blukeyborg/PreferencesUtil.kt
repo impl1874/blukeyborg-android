@@ -145,6 +145,17 @@ object PreferencesUtil {
 			.apply()
 	}
 
+	// Touchpad sensitivity //////////////////////////////////////////////////////
+	private const val KEY_TOUCHPAD_SENSITIVITY = "pref_touchpad_sensitivity"
+
+	fun getTouchpadSensitivity(context: Context): Float {
+		return prefs(context).getFloat(KEY_TOUCHPAD_SENSITIVITY, 2.0f)
+	}
+
+	fun setTouchpadSensitivity(context: Context, value: Float) {
+		prefs(context).edit().putFloat(KEY_TOUCHPAD_SENSITIVITY, value).apply()
+	}
+
 	private const val KEY_KP2A_PLUGIN_ENABLED = "pref_enable_kp2a_plugin"
 
 	fun isKp2aPluginEnabled(context: Context): Boolean =

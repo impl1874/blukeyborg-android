@@ -19,6 +19,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlin.math.max
+import kotlin.math.abs
 
 class RemoteControlActivity : AppCompatActivity() {
 
@@ -190,6 +191,7 @@ class RemoteControlActivity : AppCompatActivity() {
 
         when (PreferencesUtil.getRemoteActionsPanel(this)) {
             "presentation" -> buildPresentationPanel()
+            "touchpad" -> buildTouchpadPanel()
             else -> buildMediaPanel() // default
         }
     }
@@ -269,6 +271,124 @@ class RemoteControlActivity : AppCompatActivity() {
             remoteTile(android.R.drawable.ic_input_add, "White", square = true) { sendKey(0x1A /*W*/) },
             remoteTile(android.R.drawable.ic_menu_close_clear_cancel, "Esc", square = true) { sendKey(0x29 /*Esc*/) }
         ))
+    }
+
+    ////////////////////////////////////////////////////////////////
+    // Touchpad panel — drag to move mouse, tap to click
+    ////////////////////////////////////////////////////////////////
+    private fun buildTouchpadPanel() {
+        // Touchpad area
+        val touchpad = TouchpadView(this).apply {
+            setBackgroundColor(0xFF1A1A2A.toInt())
+
+            // Mouse movement
+            onMove = { dx, dy ->
+                ensureFastKeysThen {
+                    BleHub.sendRawMouseEvent(0, dx, dy, 0) { _, _ -> }
+                }
+            }
+            // Click helpers
+            onLeftClick = {
+                ensureFastKeysThen {
+                    BleHub.clickMouseLeft { _, _ -> }
+                }
+            }
+            onRightClick = {
+                ensureFastKeysThen {
+                    BleHub.clickMouseRight { _, _ -> }
+                }
+            }
+            onMiddleClick = {
+                ensureFastKeysThen {
+                    BleHub.clickMouseMiddle { _, _ -> }
+                }
+            }
+            onScroll = { delta ->
+                ensureFastKeysThen {
+                    BleHub.scrollMouse(delta) { _, _ -> }
+                }
+            }
+
+            // Set sensitivity from preferences (default 2.0)
+            sensitivity = PreferencesUtil.getTouchpadSensitivity(this@RemoteControlActivity)
+        }
+
+        val touchpadLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(280)
+        ).apply {
+            setMargins(0, dp(8), 0, dp(8))
+        }
+        panelContainer.addView(touchpad, touchpadLp)
+
+        // Row of click buttons below touchpad
+        panelContainer.addView(buildRow(
+            clickButton("Left", android.R.drawable.ic_menu_view) {
+                ensureFastKeysThen {
+                    BleHub.clickMouseLeft { _, _ -> }
+                }
+            },
+            clickButton("Middle", android.R.drawable.ic_menu_view) {
+                ensureFastKeysThen {
+                    BleHub.clickMouseMiddle { _, _ -> }
+                }
+            },
+            clickButton("Right", android.R.drawable.ic_menu_view) {
+                ensureFastKeysThen {
+                    BleHub.clickMouseRight { _, _ -> }
+                }
+            }
+        ))
+
+        panelContainer.addView(spacer(dp(8)))
+
+        // Hint text
+        val hint = TextView(this).apply {
+            text = "Drag to move • Tap to click\nTwo-finger scroll"
+            textSize = 11f
+            setTextColor(0xFF888888.toInt())
+            gravity = Gravity.CENTER
+        }
+        panelContainer.addView(hint)
+    }
+
+    // Small click button for touchpad panel
+    private fun clickButton(label: String, iconRes: Int, onTap: () -> Unit): View {
+        val bg = GradientDrawable().apply {
+            cornerRadius = dp(10).toFloat()
+            setColor(0xFF6A57B6.toInt())
+        }
+
+        val icon = ImageView(this).apply {
+            setImageResource(iconRes)
+            setColorFilter(0xFFFFFFFF.toInt())
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+
+        val text = TextView(this).apply {
+            text = label
+            textSize = 11f
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, 0)
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = bg
+            isClickable = true
+            isFocusable = true
+            minimumHeight = dp(56)
+
+            addView(icon)
+            addView(text)
+
+            setOnClickListener { onTap() }
+        }
     }
 
     private fun buildRow(vararg tiles: View): LinearLayout {
